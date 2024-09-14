@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -16,6 +16,7 @@ use crate::io::file::FileExt;
 use crate::io::Io;
 use crate::replication::storage::ReplicateFromStorage;
 use crate::segment::current::CurrentSegment;
+use crate::segment_swap_strategy::SegmentSwapStrategy;
 use crate::transaction::{ReadTransaction, Savepoint, Transaction, TxGuard, WriteTransaction};
 use libsql_sys::name::NamespaceName;
 
@@ -46,15 +47,14 @@ pub struct SharedWal<IO: Io> {
     pub(crate) registry: Arc<dyn SwapLog<IO>>,
     #[allow(dead_code)] // used by replication
     pub(crate) checkpointed_frame_no: AtomicU64,
-    /// max frame_no acknoledged by the durable storage
+    /// max frame_no acknowledged by the durable storage
     pub(crate) durable_frame_no: Arc<Mutex<u64>>,
     pub(crate) new_frame_notifier: tokio::sync::watch::Sender<u64>,
     pub(crate) stored_segments: Box<dyn ReplicateFromStorage>,
     pub(crate) shutdown: AtomicBool,
     pub(crate) checkpoint_notifier: mpsc::Sender<CheckpointMessage>,
-    /// maximum size the segment is allowed to grow
-    pub(crate) max_segment_size: AtomicUsize,
     pub(crate) io: Arc<IO>,
+    pub(crate) swap_strategy: Box<dyn SegmentSwapStrategy>,
 }
 
 impl<IO: Io> SharedWal<IO> {
@@ -79,7 +79,7 @@ impl<IO: Io> SharedWal<IO> {
         }
         // The current segment will not be used anymore. It's empty, but we still seal it so that
         // the next startup doesn't find an unsealed segment.
-        self.current.load().seal()?;
+        self.current.load().seal(self.io.now())?;
         tracing::info!("namespace shutdown");
         Ok(())
     }
@@ -106,8 +106,13 @@ impl<IO: Io> SharedWal<IO> {
         // is not sealed. If the segment is sealed, retry with the current segment
         let current = self.current.load();
         current.inc_reader_count();
-        let (max_frame_no, db_size) =
-            current.with_header(|header| (header.last_committed(), header.size_after()));
+        let (max_frame_no, db_size, max_offset) = current.with_header(|header| {
+            (
+                header.last_committed(),
+                header.size_after(),
+                header.frame_count() as u64,
+            )
+        });
         let id = self.wal_lock.next_tx_id.fetch_add(1, Ordering::Relaxed);
         ReadTransaction {
             id,
@@ -119,6 +124,7 @@ impl<IO: Io> SharedWal<IO> {
             pages_read: 0,
             namespace: self.namespace.clone(),
             checkpoint_notifier: self.checkpoint_notifier.clone(),
+            max_offset,
         }
     }
 
@@ -274,10 +280,9 @@ impl<IO: Io> SharedWal<IO> {
             self.new_frame_notifier.send_replace(last_committed);
         }
 
-        if tx.is_commited()
-            && current.count_committed() > self.max_segment_size.load(Ordering::Relaxed)
-        {
+        if tx.is_commited() && self.swap_strategy.should_swap(current.count_committed()) {
             self.swap_current(&tx)?;
+            self.swap_strategy.swapped();
         }
 
         Ok(())

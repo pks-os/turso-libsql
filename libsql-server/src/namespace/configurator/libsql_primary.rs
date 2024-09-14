@@ -3,10 +3,13 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use futures::prelude::Future;
 use libsql_sys::name::NamespaceResolver;
+use libsql_sys::wal::either::Either;
 use libsql_wal::io::StdIO;
 use libsql_wal::registry::WalRegistry;
+use libsql_wal::storage::backend::Backend;
 use libsql_wal::wal::LibsqlWalManager;
 use tokio::task::JoinSet;
 
@@ -25,6 +28,7 @@ use crate::schema::{has_pending_migration_task, setup_migration_table};
 use crate::stats::Stats;
 use crate::{SqldStorage, DB_CREATE_TIMEOUT, DEFAULT_AUTO_CHECKPOINT};
 
+use super::helpers::cleanup_libsql;
 use super::{BaseNamespaceConfig, ConfigureNamespace, PrimaryConfig};
 
 pub struct LibsqlPrimaryConfigurator {
@@ -248,23 +252,52 @@ impl ConfigureNamespace for LibsqlPrimaryConfigurator {
 
     fn cleanup<'a>(
         &'a self,
-        _namespace: &'a NamespaceName,
+        namespace: &'a NamespaceName,
         _db_config: &'a DatabaseConfig,
         _prune_all: bool,
         _bottomless_db_id_init: NamespaceBottomlessDbIdInit,
     ) -> Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'a>> {
-        unimplemented!()
+        Box::pin(cleanup_libsql(
+            namespace,
+            &self.registry,
+            &self.base.base_path,
+        ))
     }
 
     fn fork<'a>(
         &'a self,
-        _from_ns: &'a Namespace,
+        from_ns: &'a Namespace,
         _from_config: MetaStoreHandle,
         _to_ns: NamespaceName,
         _to_config: MetaStoreHandle,
-        _timestamp: Option<chrono::prelude::NaiveDateTime>,
+        timestamp: Option<DateTime<Utc>>,
         _store: NamespaceStore,
     ) -> Pin<Box<dyn Future<Output = crate::Result<Namespace>> + Send + 'a>> {
-        unimplemented!()
+        Box::pin(async move {
+            match self.registry.storage() {
+                Either::A(s) => {
+                    match timestamp {
+                        Some(ts) => {
+                            let ns: libsql_sys::name::NamespaceName = from_ns.name().clone().into();
+                            let _key = s
+                                .backend()
+                                .find_segment(
+                                    &s.backend().default_config(),
+                                    &ns,
+                                    libsql_wal::storage::backend::FindSegmentReq::Timestamp(ts),
+                                )
+                                .await
+                                .unwrap();
+                            todo!()
+                        }
+                        // find the most recent frame_no
+                        None => todo!("fork from most recent"),
+                    };
+                }
+                Either::B(_) => {
+                    todo!("cannot fork without storage");
+                }
+            }
+        })
     }
 }

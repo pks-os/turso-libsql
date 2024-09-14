@@ -115,6 +115,7 @@ mod stats;
 #[cfg(test)]
 mod test;
 mod utils;
+pub mod wal_toolkit;
 
 const DB_CREATE_TIMEOUT: Duration = Duration::from_secs(1);
 const DEFAULT_AUTO_CHECKPOINT: u32 = 1000;
@@ -181,6 +182,7 @@ pub struct Server<C = HttpConnector, A = AddrIncoming, D = HttpsConnector<HttpCo
     pub should_sync_from_storage: bool,
     pub force_load_wals: bool,
     pub sync_conccurency: usize,
+    pub set_log_level: Option<Box<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync + 'static>>,
 }
 
 impl<C, A, D> Default for Server<C, A, D> {
@@ -210,6 +212,7 @@ impl<C, A, D> Default for Server<C, A, D> {
             should_sync_from_storage: false,
             force_load_wals: false,
             sync_conccurency: 8,
+            set_log_level: None,
         }
     }
 }
@@ -225,6 +228,7 @@ struct Services<A, P, S, C> {
     disable_default_namespace: bool,
     db_config: DbConfig,
     user_auth_strategy: Auth,
+    pub set_log_level: Option<Box<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync + 'static>>,
 }
 
 struct TaskManager {
@@ -304,7 +308,7 @@ where
     S: ReplicationLog,
     C: Connector,
 {
-    fn configure(self, task_manager: &mut TaskManager) {
+    fn configure(mut self, task_manager: &mut TaskManager) {
         let user_http = UserApi {
             http_acceptor: self.user_api_config.http_acceptor,
             hrana_ws_acceptor: self.user_api_config.hrana_ws_acceptor,
@@ -339,6 +343,7 @@ where
                     disable_metrics,
                     shutdown,
                     auth_key.map(Into::into),
+                    self.set_log_level.take(),
                 )
             });
         }
@@ -538,7 +543,7 @@ where
     }
 
     fn make_services<P: Proxy, L: ReplicationLog>(
-        self,
+        mut self,
         namespace_store: NamespaceStore,
         idle_shutdown_kicker: Option<IdleShutdownKicker>,
         proxy_service: P,
@@ -556,6 +561,7 @@ where
             disable_default_namespace: self.disable_default_namespace,
             db_config: self.db_config,
             user_auth_strategy,
+            set_log_level: self.set_log_level.take(),
         }
     }
 

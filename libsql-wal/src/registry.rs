@@ -3,7 +3,7 @@ use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use libsql_sys::ffi::Sqlite3DbHeader;
@@ -25,6 +25,9 @@ use crate::replication::storage::{ReplicateFromStorage as _, StorageReplicator};
 use crate::segment::list::SegmentList;
 use crate::segment::Segment;
 use crate::segment::{current::CurrentSegment, sealed::SealedSegment};
+use crate::segment_swap_strategy::duration::DurationSwapStrategy;
+use crate::segment_swap_strategy::frame_count::FrameCountSwapStrategy;
+use crate::segment_swap_strategy::SegmentSwapStrategy;
 use crate::shared_wal::{SharedWal, SwapLog};
 use crate::storage::{OnStoreCallback, Storage};
 use crate::transaction::TxGuard;
@@ -37,6 +40,8 @@ enum Slot<IO: Io> {
     /// entry in the registry map puts a building slot. Other connections will wait for the mutex
     /// to turn to true, after the slot has been updated to contain the wal
     Building(Arc<(Condvar, Mutex<bool>)>, Arc<Notify>),
+    /// The namespace was removed
+    Tombstone,
 }
 
 /// Wal Registry maintains a set of shared Wal, and their respective set of files.
@@ -85,6 +90,7 @@ impl<IO: Io, S> WalRegistry<IO, S> {
                 match self.opened.get(namespace).as_deref() {
                     Some(Slot::Wal(wal)) => return Some(wal.clone()),
                     Some(Slot::Building(_, notify)) => notify.clone(),
+                    Some(Slot::Tombstone) => return None,
                     None => return None,
                 }
             };
@@ -178,6 +184,7 @@ where
                         // the slot was updated: try again
                         continue;
                     }
+                    Slot::Tombstone => return Err(crate::error::Error::DeletingWal),
                 }
             }
 
@@ -185,6 +192,7 @@ where
                 dashmap::Entry::Occupied(e) => match e.get() {
                     Slot::Wal(shared) => return Ok(shared.clone()),
                     Slot::Building(wait, _) => Err(wait.clone()),
+                    Slot::Tombstone => return Err(crate::error::Error::DeletingWal),
                 },
                 dashmap::Entry::Vacant(e) => {
                     let notifier = Arc::new((Condvar::new(), Mutex::new(false)));
@@ -332,6 +340,17 @@ where
 
         let (new_frame_notifier, _) = tokio::sync::watch::channel(next_frame_no.get() - 1);
 
+        // FIXME: make swap strategy configurable
+        // This strategy will perform a swap if either the wal is bigger than 20k frames, or older
+        // than 10 minutes, or if the frame count is greater than a 1000 and the wal was last
+        // swapped more than 30 secs ago
+        let swap_strategy = Box::new(
+            DurationSwapStrategy::new(Duration::from_secs(5 * 60))
+                .or(FrameCountSwapStrategy::new(20_000))
+                .or(FrameCountSwapStrategy::new(1000)
+                    .and(DurationSwapStrategy::new(Duration::from_secs(30)))),
+        );
+
         let shared = Arc::new(SharedWal {
             current,
             wal_lock: Default::default(),
@@ -347,8 +366,8 @@ where
             )),
             shutdown: false.into(),
             checkpoint_notifier: self.checkpoint_notifier.clone(),
-            max_segment_size: 1000.into(),
             io: self.io.clone(),
+            swap_strategy,
         });
 
         self.opened
@@ -368,6 +387,37 @@ where
         } else {
             Ok(None)
         }
+    }
+
+    pub async fn tombstone(&self, namespace: &NamespaceName) -> Option<Arc<SharedWal<IO>>> {
+        // if a wal is currently being openned, let it
+        {
+            let v = self.opened.get(namespace)?;
+            if let Slot::Building(_, ref notify) = *v {
+                notify.clone().notified().await;
+            }
+        }
+
+        match self.opened.insert(namespace.clone(), Slot::Tombstone) {
+            Some(Slot::Tombstone) => None,
+            Some(Slot::Building(_, _)) => {
+                unreachable!("already waited for ns to open")
+            }
+            Some(Slot::Wal(wal)) => Some(wal),
+            None => None,
+        }
+    }
+
+    pub async fn remove(&self, namespace: &NamespaceName) {
+        // if a wal is currently being openned, let it
+        {
+            let v = self.opened.get(namespace);
+            if let Some(Slot::Building(_, ref notify)) = v.as_deref() {
+                notify.clone().notified().await;
+            }
+        }
+
+        self.opened.remove(namespace);
     }
 
     /// Attempts to sync all loaded dbs with durable storage
@@ -445,6 +495,7 @@ where
                         // wait for shared to finish building
                         notify.notified().await;
                     }
+                    Slot::Tombstone => continue,
                 }
             }
         }
@@ -491,7 +542,7 @@ where
         )?;
         // sealing must the last fallible operation, because we don't want to end up in a situation
         // where the current log is sealed and it wasn't swapped.
-        if let Some(sealed) = current.seal()? {
+        if let Some(sealed) = current.seal(self.io.now())? {
             new.tail().push(sealed.clone());
             maybe_store_segment(
                 self.storage.as_ref(),
@@ -506,6 +557,10 @@ where
         tracing::debug!("current segment swapped");
 
         Ok(())
+    }
+
+    pub fn storage(&self) -> &S {
+        &self.storage
     }
 }
 

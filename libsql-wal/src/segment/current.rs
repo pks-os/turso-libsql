@@ -9,6 +9,7 @@ use std::sync::{
     Arc,
 };
 
+use chrono::{DateTime, Utc};
 use crossbeam_skiplist::SkipMap;
 use fst::MapBuilder;
 use parking_lot::{Mutex, RwLock};
@@ -74,6 +75,7 @@ impl<F> CurrentSegment<F> {
             page_size: LIBSQL_PAGE_SIZE.into(),
             log_id: log_id.as_u128().into(),
             frame_count: 0.into(),
+            sealed_at_timestamp: 0.into(),
         };
 
         header.recompute_checksum();
@@ -370,7 +372,7 @@ impl<F> CurrentSegment<F> {
         }
 
         // not a write tx, or page is not in write tx, look into the segment
-        self.index.locate(page_no, tx.max_frame_no)
+        self.index.locate(page_no, tx.max_offset)
     }
 
     /// reads the page conainted in frame at offset into buf
@@ -408,7 +410,7 @@ impl<F> CurrentSegment<F> {
 
     /// It is expected that sealing is performed under a write lock
     #[tracing::instrument(skip_all)]
-    pub fn seal(&self) -> Result<Option<SealedSegment<F>>>
+    pub fn seal(&self, now: DateTime<Utc>) -> Result<Option<SealedSegment<F>>>
     where
         F: FileExt,
     {
@@ -442,6 +444,7 @@ impl<F> CurrentSegment<F> {
         header.index_size = index_size.into();
         let flags = header.flags();
         header.set_flags(flags | SegmentFlags::SEALED);
+        header.sealed_at_timestamp = (now.timestamp_millis() as u64).into();
         header.recompute_checksum();
         self.file.write_all_at(header.as_bytes(), 0)?;
 
@@ -644,13 +647,13 @@ impl SegmentIndex {
         }
     }
 
-    fn locate(&self, page_no: u32, max_frame_no: u64) -> Option<u32> {
+    fn locate(&self, page_no: u32, max_offset: u64) -> Option<u32> {
         let offsets = self.index.get(&page_no)?;
         let offsets = offsets.value().read();
         offsets
             .iter()
             .rev()
-            .find(|fno| self.start_frame_no + **fno as u64 <= max_frame_no)
+            .find(|fno| **fno as u64 <= max_offset)
             .copied()
     }
 
@@ -670,42 +673,6 @@ impl SegmentIndex {
 
         builder.finish()?;
         Ok(())
-    }
-
-    /// returns an iterator over (page_no, offset, frame_no), where the returned offset is the most
-    /// recent version of the page contained in start_frame_no..end_frame_no
-    /// This method assumes that the current segment is ordered.
-    pub(crate) fn iter(
-        &self,
-        start_frame_no: u64,
-        end_frame_no: u64,
-    ) -> impl Iterator<Item = (u32, u32, u64)> + '_ {
-        // todo: assert segment is sorted
-        let mut entry = self.index.front();
-        let mut fused = false;
-        let start_offset = (start_frame_no - self.start_frame_no) as u32;
-        let end_offset = (end_frame_no - self.start_frame_no) as u32;
-        std::iter::from_fn(move || loop {
-            if fused {
-                return None;
-            }
-            let entry = entry.as_mut()?;
-            let ret = {
-                let offsets = entry.value();
-                let offsets = offsets.read();
-                if offsets[0] > end_offset || *offsets.last().unwrap() < start_offset {
-                    drop(offsets);
-                    fused = !entry.move_next();
-                    continue;
-                }
-                let offset = *offsets.iter().rev().find(|x| **x <= end_offset).unwrap();
-                Some((*entry.key(), offset, self.start_frame_no + offset as u64))
-            };
-
-            fused = !entry.move_next();
-
-            return ret;
-        })
     }
 
     pub(crate) fn insert(&self, page_no: u32, offset: u32) {
@@ -733,40 +700,6 @@ mod test {
     use crate::test::{seal_current_segment, TestEnv};
 
     use super::*;
-
-    #[test]
-    fn index_iter() {
-        let index = SegmentIndex::new(42);
-        index.insert(1, 0);
-        index.insert(1, 3);
-        index.insert(2, 1);
-        index.insert(2, 2);
-        index.insert(3, 5);
-        index.insert(3, 15);
-        let mut iter = index.iter(42, 50);
-        assert_eq!(iter.next(), Some((1, 3, 42 + 3)));
-        assert_eq!(iter.next(), Some((2, 2, 42 + 2)));
-        assert_eq!(iter.next(), Some((3, 5, 42 + 5)));
-        assert_eq!(iter.next(), None);
-
-        let mut iter = index.iter(42, 100);
-        assert_eq!(iter.next(), Some((1, 3, 42 + 3)));
-        assert_eq!(iter.next(), Some((2, 2, 42 + 2)));
-        assert_eq!(iter.next(), Some((3, 15, 42 + 15)));
-        assert_eq!(iter.next(), None);
-    }
-
-    #[should_panic]
-    #[test]
-    fn index_iter_out_of_bounds() {
-        let index = SegmentIndex::new(42);
-        index.insert(1, 0);
-        index.insert(1, 3);
-        index.insert(2, 1);
-        index.insert(2, 2);
-        assert_eq!(index.iter(1, 41).count(), 0);
-        assert_eq!(index.iter(43, 72).count(), 0);
-    }
 
     #[tokio::test]
     async fn current_stream_frames() {
