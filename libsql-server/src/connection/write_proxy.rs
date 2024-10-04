@@ -1,5 +1,8 @@
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
+use futures::Future;
 use futures_core::future::BoxFuture;
 use futures_core::Stream;
 use libsql_replication::rpc::proxy::proxy_client::ProxyClient;
@@ -8,10 +11,10 @@ use libsql_replication::rpc::proxy::{
 };
 use libsql_sys::EncryptionConfig;
 use parking_lot::Mutex as PMutex;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, Mutex};
 use tokio_stream::StreamExt;
 use tonic::transport::Channel;
-use tonic::{Request, Streaming};
+use tonic::{Code, Request, Streaming};
 
 use crate::connection::program::{DescribeCol, DescribeParam};
 use crate::error::Error;
@@ -22,16 +25,21 @@ use crate::replication::FrameNo;
 use crate::stats::Stats;
 use crate::{Result, DEFAULT_AUTO_CHECKPOINT};
 
+use super::connection_core::GetCurrentFrameNo;
 use super::program::DescribeResponse;
 use super::{Connection, RequestContext};
 use super::{MakeConnection, Program};
 
 pub type RpcStream = Streaming<ExecResp>;
+pub type WaitForFrameNo = Arc<
+    dyn Fn(FrameNo) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> + Send + 'static + Sync,
+>;
 
 pub struct MakeWriteProxyConn<M> {
     client: ProxyClient<Channel>,
     stats: Arc<Stats>,
-    applied_frame_no_receiver: watch::Receiver<Option<FrameNo>>,
+    wait_for_frame_no: WaitForFrameNo,
+    get_current_frame_no: GetCurrentFrameNo,
     max_response_size: u64,
     max_total_response_size: u64,
     primary_replication_index: Option<FrameNo>,
@@ -46,23 +54,25 @@ impl<M> MakeWriteProxyConn<M> {
         channel: Channel,
         uri: tonic::transport::Uri,
         stats: Arc<Stats>,
-        applied_frame_no_receiver: watch::Receiver<Option<FrameNo>>,
+        wait_for_frame_no: WaitForFrameNo,
         max_response_size: u64,
         max_total_response_size: u64,
         primary_replication_index: Option<FrameNo>,
         encryption_config: Option<EncryptionConfig>,
         make_read_only_conn: M,
+        get_current_frame_no: GetCurrentFrameNo,
     ) -> Self {
         let client = ProxyClient::with_origin(channel, uri);
         Self {
             client,
             stats,
-            applied_frame_no_receiver,
+            wait_for_frame_no,
             max_response_size,
             max_total_response_size,
             make_read_only_conn,
             primary_replication_index,
             encryption_config,
+            get_current_frame_no,
         }
     }
 }
@@ -77,7 +87,7 @@ where
         Ok(WriteProxyConnection::new(
             self.client.clone(),
             self.stats.clone(),
-            self.applied_frame_no_receiver.clone(),
+            self.wait_for_frame_no.clone(),
             QueryBuilderConfig {
                 max_size: Some(self.max_response_size),
                 max_total_size: Some(self.max_total_response_size),
@@ -85,6 +95,7 @@ where
                 encryption_config: self.encryption_config.clone(),
             },
             self.primary_replication_index,
+            self.get_current_frame_no.clone(),
             self.make_read_only_conn.create().await?,
         )?)
     }
@@ -99,8 +110,9 @@ pub struct WriteProxyConnection<R, C> {
     /// any subsequent read on this connection must wait for the replicator to catch up with this
     /// frame_no
     last_write_frame_no: PMutex<Option<FrameNo>>,
-    /// Notifier from the repliator of the currently applied frameno
-    applied_frame_no_receiver: watch::Receiver<Option<FrameNo>>,
+    /// Notifier from the replicator of the currently applied frame_no
+    wait_for_frame_no: WaitForFrameNo,
+    get_current_frame_no: GetCurrentFrameNo,
     builder_config: QueryBuilderConfig,
     stats: Arc<Stats>,
 
@@ -114,9 +126,10 @@ impl<C: Connection> WriteProxyConnection<RpcStream, C> {
     fn new(
         write_proxy: ProxyClient<Channel>,
         stats: Arc<Stats>,
-        applied_frame_no_receiver: watch::Receiver<Option<FrameNo>>,
+        wait_for_frame_no: WaitForFrameNo,
         builder_config: QueryBuilderConfig,
         primary_replication_index: Option<u64>,
+        get_current_frame_no: GetCurrentFrameNo,
         read_conn: C,
     ) -> Result<Self> {
         Ok(Self {
@@ -124,11 +137,12 @@ impl<C: Connection> WriteProxyConnection<RpcStream, C> {
             write_proxy,
             state: Mutex::new(TxnStatus::Init),
             last_write_frame_no: Default::default(),
-            applied_frame_no_receiver,
+            wait_for_frame_no,
             builder_config,
             stats,
             remote_conn: Default::default(),
             primary_replication_index,
+            get_current_frame_no,
         })
     }
 
@@ -199,15 +213,7 @@ impl<C: Connection> WriteProxyConnection<RpcStream, C> {
         let current_fno = replication_index.or_else(|| *self.last_write_frame_no.lock());
         match current_fno {
             Some(current_frame_no) => {
-                let mut receiver = self.applied_frame_no_receiver.clone();
-                receiver
-                    .wait_for(|last_applied| match last_applied {
-                        Some(x) => *x >= current_frame_no,
-                        None => true,
-                    })
-                    .await
-                    .map_err(|_| Error::ReplicatorExited)?;
-
+                (self.wait_for_frame_no)(current_frame_no).await;
                 Ok(())
             }
             None => Ok(()),
@@ -219,7 +225,7 @@ impl<C: Connection> WriteProxyConnection<RpcStream, C> {
     fn should_proxy(&self) -> bool {
         // There primary has data
         if let Some(primary_index) = self.primary_replication_index {
-            let last_applied = *self.applied_frame_no_receiver.borrow();
+            let last_applied = (self.get_current_frame_no)();
             // if we either don't have data while the primary has, or the data we have is
             // anterior to that of the primary when we loaded the namespace, then proxy the
             // request to the primary
@@ -249,19 +255,35 @@ impl RemoteConnection {
         ctx: RequestContext,
         builder_config: QueryBuilderConfig,
     ) -> crate::Result<Self> {
-        let (request_sender, receiver) = mpsc::channel(1);
+        let mut retries = 0;
 
-        let stream = tokio_stream::wrappers::ReceiverStream::new(receiver);
-        let mut req = Request::new(stream);
-        ctx.upgrade_grpc_request(&mut req);
-        let response_stream = client.stream_exec(req).await?.into_inner();
+        loop {
+            let (request_sender, receiver) = mpsc::channel(1);
 
-        Ok(Self {
-            response_stream,
-            request_sender,
-            current_request_id: 0,
-            builder_config,
-        })
+            let stream = tokio_stream::wrappers::ReceiverStream::new(receiver);
+            let mut req = Request::new(stream);
+            ctx.upgrade_grpc_request(&mut req);
+            let response_stream = match client.stream_exec(req).await {
+                Ok(i) => i.into_inner(),
+                Err(e) => {
+                    if e.code() == Code::Unavailable {
+                        tracing::error!("retrying proxy connection: {}", e);
+                        tokio::time::sleep(Duration::from_millis(500) * 2u32.pow(retries)).await;
+                        retries += 1;
+                        continue;
+                    } else {
+                        return Err(e.into());
+                    }
+                }
+            };
+
+            return Ok(Self {
+                response_stream,
+                request_sender,
+                current_request_id: 0,
+                builder_config,
+            });
+        }
     }
 }
 
