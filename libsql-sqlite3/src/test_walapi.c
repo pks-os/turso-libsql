@@ -1,6 +1,7 @@
 #include <sqlite3.h>
 #include <stdio.h>
 #include <string.h>
+#include <assert.h>
 
 #if 0
 static void dump_frame(unsigned char *frame, size_t size){
@@ -103,42 +104,52 @@ static void gen_data(sqlite3 *db){
   sqlite3_exec(db, "INSERT INTO users (id, name) VALUES (3, 'Jim Beam')", 0, 0, 0);
 }
 
+int open_db(const char *path, sqlite3 **db) {
+  int rc;
+
+  rc = sqlite3_open(path, db);
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "Can't open database %s: %s\n", path, sqlite3_errmsg(*db));
+    return rc;
+  }
+  rc = sqlite3_exec(*db, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "Can't set journal mode for %s: %s\n", path, sqlite3_errmsg(*db));
+    return rc;
+  }
+  rc = sqlite3_wal_autocheckpoint(*db, 0);
+  if (rc != SQLITE_OK) {
+      fprintf(stderr, "Can't disable checkpointing for %s: %s\n", path, sqlite3_errmsg(*db));
+      return rc;
+  }
+  return rc;
+}
+
 int main(int argc, char *argv[])
 {
     sqlite3 *db_primary, *db_backup;
+    unsigned int max_frame;
     int rc;
 
-    rc = sqlite3_open("primary.db", &db_primary);
+    rc = open_db("primary.db", &db_primary);
     if (rc != SQLITE_OK) {
-        fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(db_primary));
         return 1;
     }
-    rc = sqlite3_wal_autocheckpoint(db_primary, 0);
-    if (rc != SQLITE_OK) {
-        fprintf(stderr, "Can't disable checkpointing: %s\n", sqlite3_errmsg(db_primary));
-        return 1;
-    }
-    sqlite3_exec(db_primary, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
-
     gen_data(db_primary);
 
-    rc = sqlite3_open("backup.db", &db_backup); 
+    rc = open_db("backup.db", &db_backup);
     if (rc != SQLITE_OK) {
-        fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(db_backup));
         return 1;
     }
-    rc = sqlite3_wal_autocheckpoint(db_backup, 0);
+    rc = libsql_wal_frame_count(db_backup, &max_frame);
     if (rc != SQLITE_OK) {
-        fprintf(stderr, "Can't disable checkpointing: %s\n", sqlite3_errmsg(db_backup));
+        fprintf(stderr, "Can't get frame count for backup: %s\n", sqlite3_errmsg(db_backup));
         return 1;
     }
-    rc = sqlite3_exec(db_backup, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
-    if (rc != SQLITE_OK) {
-        fprintf(stderr, "Can't set journal mode: %s\n", sqlite3_errmsg(db_backup));
-        return 1;
-    }
-
+    assert(max_frame == 0);
+    
     sync_db(db_primary, db_backup);
+
     if (cmp_data(db_primary, db_backup)) {
         return 1;
     }
