@@ -244,8 +244,7 @@ impl SyncContext {
                 None => {}
             }
 
-            let req = req.body(Body::empty())
-                .expect("valid request");
+            let req = req.body(Body::empty()).expect("valid request");
 
             let res = self
                 .client
@@ -309,7 +308,7 @@ impl SyncContext {
     async fn read_metadata(&mut self) -> Result<()> {
         let path = format!("{}-info", self.db_path);
 
-        if !std::fs::exists(&path).map_err(SyncError::io("metadata file exists"))? {
+        if !Path::new(&path).try_exists().map_err(SyncError::io("metadata file exists"))? {
             tracing::debug!("no metadata info file found");
             return Ok(());
         }
